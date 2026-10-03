@@ -3678,23 +3678,67 @@ const School = (()=>{
 
 /* ---------------- TEACHER — the cat reads out loud (female voices only) ---------------- */
 const Teacher = (()=>{
-  const tts=()=>window.speechSynthesis||null; let token=0;
+  /* Reads school text out loud. Prefers Grok's own voice (xAI text-to-speech, same Ara / Eve voices as voice chat);
+     falls back to the device voice only when Grok can't be reached. Whole lines are sent in one go, so nothing gets chopped. */
+  const tts=()=>window.speechSynthesis||null; let token=0; let audio=null; const cache=new Map(); const live=[];
+  const G={cloud:null,eph:null,ephTok:null,ephExp:0,lastErr:"",used:false};
   const enabled=()=>S.settings.readAloud!==false&&!S.settings.muted;
   const clean=t=>String(t||"").replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}]/gu,"").replace(/_/g," blank ")
     .replace(/\$(\d+)\.(\d\d)/g,(m,d,c)=>`${+d} dollar${d==="1"?"":"s"}${+c?" and "+(+c)+" cents":""}`).replace(/(\d+)¢/g,"$1 cents").replace(/(\d+)\/(\d+)/g,(m,a,b)=>School.fracSay(+a,+b))
-    .replace(/(\d{1,2}):00\b/g,"$1 o'clock").replace(/×/g," times ").replace(/÷/g," divided by ").replace(/−/g," minus ").replace(/ = /g," equals ").replace(/ \+ /g," plus ").replace(/✓/g,"").replace(/\s+/g," ").trim();
+    .replace(/(\d{1,2}):00\b/g,"$1 o'clock").replace(/×/g," times ").replace(/÷/g," divided by ").replace(/−/g," minus ").replace(/ = /g," equals ").replace(/ \+ /g," plus ").replace(/✓/g,"").replace(/\s*…\s*/g,", ").replace(/,\s*([,.!?])/g,"$1").replace(/([.!?])\s*,\s*/g,"$1 ").replace(/\s+/g," ").trim();
   function voiceBusy(){ try{ return !!(window.Voice&&Voice.state&&Voice.state.active); }catch(e){ return false; } }
-  function say(text,o){ o=o||{}; const t=tts(); text=clean(text); if(!t||!text) return false; if(!o.force&&!enabled()) return false; if(voiceBusy()) return false;
-    const my=++token; try{ t.cancel(); }catch(e){}
-    const parts=text.match(/[^.!?…]+[.!?…]*/g)||[text]; const cat=CATS[Game.activeCat().id]; let v=null; try{ v=pickFemaleVoice(t); }catch(e){}
-    const rate=(o.slow?0.7:1)*(S.settings.readRate||0.95);
-    parts.forEach((p,i)=>{ const u=new SpeechSynthesisUtterance(p.trim()); u.lang="en-US"; if(v) u.voice=v; u.pitch=femalePitch(cat,v); u.rate=rate;
-      if(i===0) u.onstart=()=>{ if(my===token&&o.onstart) o.onstart(); };
-      if(i===parts.length-1){ const done=()=>{ if(my===token&&o.onend) o.onend(); }; u.onend=done; u.onerror=done; }
-      try{ t.speak(u); }catch(e){} });
+  function voiceId(){ try{ return femaleXai(CATS[Game.activeCat().id].voice); }catch(e){ return "ara"; } }
+  function rate(slow){ return clamp((S.settings.readRate||0.95)*(slow?0.75:1),0.7,1.5); }
+  function wantGrok(){ return S.settings.schoolVoice!=="device"; }
+  function key(){ try{ return (Voice.cfg().xaiKey||"").trim(); }catch(e){ return ""; } }
+  function grokPossible(){ if(!wantGrok()||Date.now()<(G.pauseUntil||0)) return false; if(key()) return true; if(!Cloud.available()) return false; return G.cloud!==false||(G.eph!==false&&Voice.state.cloudReady!==false); }
+  function el(){ if(!audio){ audio=new Audio(); audio.preload="auto"; } return audio; }
+  /* iOS/Safari: unlock the audio element on the first tap so later lines can play */
+  function silentUrl(){ const n=800, b=new ArrayBuffer(44+n*2), v=new DataView(b); const w=(o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i)); };
+    w(0,"RIFF"); v.setUint32(4,36+n*2,true); w(8,"WAVE"); w(12,"fmt "); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true); v.setUint32(24,8000,true); v.setUint32(28,16000,true); v.setUint16(32,2,true); v.setUint16(34,16,true); w(36,"data"); v.setUint32(40,n*2,true);
+    return URL.createObjectURL(new Blob([b],{type:"audio/wav"})); }
+  try{ document.addEventListener("pointerdown",function unlock(){ try{ const a=el(); if(!a.src){ a.src=silentUrl(); a.play().catch(()=>{}); } }catch(e){} document.removeEventListener("pointerdown",unlock,true); },true); }catch(e){}
+  function b64url(b64){ const bin=atob(b64); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return URL.createObjectURL(new Blob([u],{type:"audio/mpeg"})); }
+  function tok(j){ if(!j) return null; if(typeof j==="string") return j; return j.value||(j.client_secret&&(j.client_secret.value||j.client_secret))||j.token||j.secret||(j.data&&tok(j.data))||null; }
+  async function direct(bearer,body){ const r=await fetch("https://api.x.ai/v1/tts",{method:"POST",headers:{"Authorization":"Bearer "+bearer,"Content-Type":"application/json"},body:JSON.stringify(body)}); if(!r.ok){ const e=new Error("Grok voice error "+r.status); e.status=r.status; throw e; } const bl=await r.blob(); if(!bl.size) throw new Error("empty audio"); return URL.createObjectURL(bl); }
+  function grokAudio(text,speed){ const vid=voiceId(); const ck=vid+"|"+speed+"|"+text; if(cache.has(ck)) return cache.get(ck);
+    const body={text,voice_id:vid,language:"en",speed,output_format:{codec:"mp3",sample_rate:24000,bit_rate:64000}};
+    const p=(async()=>{
+      const k=key(); if(k) return direct(k,body);
+      if(!Cloud.available()) throw new Error("no cloud");
+      if(G.cloud!==false){ try{ const r=await Cloud.call("speak",text,vid,speed); const b64=typeof r==="string"?r:(r&&(r.audio||r.data)); if(!b64) throw new Error(r&&r.error?r.error:"no audio"); G.cloud=true; return b64url(b64); }
+        catch(e){ G.lastErr=String(e&&e.message||e); if(G.cloud===true) throw e; G.cloud=false; } }
+      if(G.eph!==false&&Voice.state.cloudReady!==false){ try{ if(!G.ephTok||Date.now()>G.ephExp){ G.ephTok=tok(await Cloud.call("getVoiceToken")); G.ephExp=Date.now()+8*60000; } if(!G.ephTok) throw new Error("no token"); const u=await direct(G.ephTok,body); G.eph=true; return u; }
+        catch(e){ G.lastErr=String(e&&e.message||e); if(e&&(e.status===401||e.status===403)){ G.ephTok=null; if(G.eph!==true) G.eph=false; } else if(G.eph!==true) G.eph=false; throw e; } }
+      throw new Error("Grok voice not set up");
+    })();
+    p.then(()=>{ G.failN=0; },()=>{ G.failN=(G.failN||0)+1; if(G.failN>=2){ G.pauseUntil=Date.now()+90000; G.failN=0; } });
+    cache.set(ck,p); p.catch(()=>cache.delete(ck)); if(cache.size>90){ const first=cache.keys().next().value; cache.delete(first); }
+    return p; }
+  function browserSay(text,o,my){ const t=tts(); if(!t) { if(o.onend) o.onend(); return false; } try{ t.cancel(); }catch(e){}
+    const cat=CATS[Game.activeCat().id]; let v=null; try{ v=pickFemaleVoice(t); }catch(e){}
+    // short lines go in one piece (no choppy gaps); very long ones split at sentence ends to dodge Chrome's ~15s cut-off
+    const parts=text.length>220?(text.match(/[^.!?]+[.!?]*/g)||[text]):[text];
+    setTimeout(()=>{ if(my!==token) return; live.length=0; // a short pause after cancel() stops Chrome from swallowing the first word
+      parts.forEach((p,i)=>{ const u=new SpeechSynthesisUtterance(p.trim()); live.push(u); u.lang="en-US"; if(v) u.voice=v; u.pitch=clamp((cat&&cat.pitch)||1.1,1,1.15); u.rate=rate(o.slow);
+        if(i===0) u.onstart=()=>{ if(my===token&&o.onstart) o.onstart(); };
+        if(i===parts.length-1){ const done=()=>{ if(my===token&&o.onend) o.onend(); }; u.onend=done; u.onerror=done; }
+        try{ t.speak(u); }catch(e){} }); },140);
     return true; }
-  function stop(){ token++; const t=tts(); if(t){ try{ t.cancel(); }catch(e){} } }
-  return { say, stop, enabled, get available(){ return !!tts(); } };
+  function say(text,o){ o=o||{}; text=clean(text); if(!text) return false; if(!o.force&&!enabled()) return false; if(voiceBusy()) return false;
+    const my=++token; halt();
+    if(grokPossible()){ const sp=rate(o.slow);
+      grokAudio(text,sp).then(url=>{ if(my!==token) return; const a=el(); let ended=false; const done=()=>{ if(ended) return; ended=true; if(my===token&&o.onend) o.onend(); };
+          a.onended=done; a.onerror=done; a.src=url; a.playbackRate=1;
+          const pr=a.play(); G.used=true; if(pr&&pr.then) pr.then(()=>{ if(my===token&&o.onstart) o.onstart(); }).catch(()=>{ if(my===token) browserSay(text,o,my); }); else if(o.onstart) o.onstart(); })
+        .catch(()=>{ if(my===token) browserSay(text,o,my); if(!G.warned&&!grokPossible()){ G.warned=true; try{ UI.toast("🗣️ School is using the device voice for now — Grown-ups page explains how to turn on Grok's voice",4200); }catch(e){} } });
+      return true; }
+    return browserSay(text,o,my); }
+  function prefetch(text,slow){ if(!enabled()||!grokPossible()) return; text=clean(text); if(text) grokAudio(text,rate(slow)).catch(()=>{}); }
+  function halt(){ try{ if(audio&&!audio.paused){ audio.pause(); } }catch(e){} const t=tts(); if(t){ try{ t.cancel(); }catch(e){} } }
+  function stop(){ token++; halt(); }
+  function engine(){ if(!wantGrok()) return "device"; if(key()||G.cloud===true||G.eph===true) return "grok"; return grokPossible()?"checking":"device"; }
+  return { say, stop, prefetch, enabled, engine, get info(){ return Object.assign({},G); }, get available(){ return !!tts()||grokPossible(); } };
 })();
 
 
@@ -4503,11 +4547,12 @@ UI.screen("school",{ title:"School",
     else if(mode==="normal"){ const rv=School.takeReview(subject,Math.min(2,School.reviewFor(subject).length)); const slots=shuffle([1,2,3,4,5,6,7]).slice(0,rv.length); rv.forEach((q,i)=>ss.plan[slots[i]]=q); }
     Teacher.stop(); this.timers=this.timers||[]; UI.setBusy(true); $(".body.school",this.node).classList.add("insess"); $("#scSubjects",this.node).classList.add("hide"); const s=$("#scSession",this.node); s.classList.remove("hide");
     s.innerHTML=`<div class="ss-top">${mode==="bee"?'<span class="ss-mode">🐝 Spelling Bee</span>':mode==="review"?'<span class="ss-mode">🔁 Practice again</span>':""}<div class="ss-dots" id="ssDots"></div><span class="ss-streak" id="ssStreak"></span><button class="iconbtn small" data-quit="1" aria-label="Quit">✕</button></div><div class="ss-cat" id="ssCat">${Art.cat({cat:c.id,outfit:c.outfit,expr:"normal"}).replace('viewBox="0 0 360 560"','viewBox="60 0 240 300"')}</div><div class="ss-card" id="ssCard"></div>`;
-    if(mode==="bee") this.say(`Welcome to the spelling bee! Listen carefully and spell ten words.`,{force:true,onend:()=>{}});
-    this.after(mode==="bee"?2600:0,()=>this.nextQ()); },
+    this.after(2500,()=>SCHOOL_CHEERS.forEach(c=>Teacher.prefetch(c)));
+    if(mode==="bee"){ let went=false; const go=()=>{ if(went||this.session!==ss) return; went=true; this.nextQ(); }; this.say(`Welcome to the spelling bee! Listen carefully and spell ten words.`,{force:true,onend:()=>this.after(300,go)}); this.after(7000,go); }
+    else this.nextQ(); },
   after(ms,fn){ const t=setTimeout(()=>{ if(UI.current==="school") fn(); },ms); (this.timers=this.timers||[]).push(t); },
   catExpr(expr){ const c=Game.activeCat(); const box=$("#ssCat",this.node); if(box) box.innerHTML=Art.cat({cat:c.id,outfit:c.outfit,expr}).replace('viewBox="0 0 360 560"','viewBox="60 0 240 300"'); },
-  makeQ(){ const ss=this.session; if(ss.plan[ss.q]) return ss.plan[ss.q]; let q=null;
+  makeQ(idx){ const ss=this.session; idx=idx===undefined?ss.q:idx; if(ss.pre&&ss.pre.idx===idx){ const q=ss.pre.q; ss.pre=null; return q; } if(ss.plan[idx]) return ss.plan[idx]; let q=null;
     for(let i=0;i<8;i++){ const subj=ss.subject==="mixed"?pick(SCHOOL_SUBJECT_IDS):ss.subject; q=School.question(subj,School.gradeFor(subj),{bee:ss.mode==="bee"}); if(!ss.used.has(School.qKey(q))) break; }
     ss.used.add(School.qKey(q)); return q; },
   nextQ(){ const ss=this.session; if(!ss) return; if(ss.q>=ss.total){ this.report(); return; } const q=this.makeQ(); ss.cur=q; ss.built=[]; ss.waiting=false; const node=this.node;
@@ -4523,7 +4568,8 @@ UI.screen("school",{ title:"School",
       card.innerHTML=`${top}${passage}${visual}${hear}<div class="ss-q ${q.big?"big":""} ${q.story?"story":""}">${esc(q.prompt)}</div>${q.sub?`<div class="ss-sub">${esc(q.sub)}</div>`:""}${body}<div class="ss-fb" id="ssFb"></div><div class="ss-help" id="ssHelp"></div>`;
       $$(".choice",card).forEach(b=>b.addEventListener("click",()=>this.answer(b.dataset.c,b)));
       if(q.build) this.renderSlots();
-      if(q.listen) this.say(q.say,{force:true}); else this.say(q.say); };
+      if(q.listen) this.say(q.say,{force:true}); else this.say(q.say);
+      if(ss.q+1<ss.total&&!ss.pre){ const nq=this.makeQ(ss.q+1); ss.pre={idx:ss.q+1,q:nq}; this.after(400,()=>Teacher.prefetch(nq.say)); } };
     if(q.memorize){ let t=3; card.innerHTML=`<div class="ss-subject">🧠 Memory</div><div class="ss-q">Remember these!</div><div class="ss-memo">${q.memorize.map(e=>`<span>${e}</span>`).join("")}</div><div class="ss-count" id="ssCount">3</div>`; this.say("Remember these!"); const iv=setInterval(()=>{ t--; const c=$("#ssCount",card); if(c) c.textContent=t; if(t<=0){ clearInterval(iv); if(UI.current==="school"&&this.session===ss) render(); } },1000); this.timers.push(iv); }
     else render(); },
   renderSlots(){ const ss=this.session; if(!ss||!ss.cur||!ss.cur.build) return; const w=String(ss.cur.answer); const el_=$("#spSlots",this.node); if(!el_) return;
@@ -4537,8 +4583,9 @@ UI.screen("school",{ title:"School",
       let coins=(S.daily.schoolSessions||0)<3?2:1; let bonus=""; if(ss.streak===3||ss.streak===6){ coins+=5; bonus=" 🔥 Streak +5!"; Sfx.star(); }
       Game.addCoins(coins,"school"); Game.addXP(4,"school"); Game.track("schoolCorrect",1); S.school.xp+=10; if(S.school.xp>=100&&S.school.level<10){ S.school.xp-=100; S.school.level++; Game.addStars(1,"school"); UI.toast(`🎓 School Level ${S.school.level}: ${SCHOOL_TITLES[S.school.level]}! +1 ⭐`,2600); } if(S.school.level>=10) S.school.xp=Math.min(100,S.school.xp);
       let learned=""; if(q.fromReview){ School.clearReview(q); learned=" 🔁 Learned it!"; }
-      const cheer=pick(SCHOOL_CHEERS); fb.innerHTML=`<span class="good">✅ ${cheer}${bonus}${learned}</span>`; this.say(cheer+(learned?" You learned it!":""));
-      Save.save(); this.after(1300,()=>{ ss.q++; ss.locked=false; this.catExpr("normal"); this.nextQ(); }); }
+      const cheer=pick(SCHOOL_CHEERS); fb.innerHTML=`<span class="good">✅ ${cheer}${bonus}${learned}</span>`;
+      Save.save(); let went=false; const go=()=>{ if(went||this.session!==ss) return; went=true; ss.q++; ss.locked=false; this.catExpr("normal"); this.nextQ(); };
+      const spoke=this.say(cheer+(learned?" You learned it!":""),{onend:()=>this.after(250,go)}); this.after(spoke?3200:1300,go); }
     else { if(btn) btn.classList.add("wrong"); ss.streak=0; Sfx.wrong(); this.catExpr("sad");
       if(q.build){ const sl=$("#spSlots",this.node); if(sl){ sl.classList.add("wrong"); sl.insertAdjacentHTML("afterend",`<div class="sp-correct">${String(q.answer).toUpperCase().split("").map(l=>`<span>${esc(l)}</span>`).join("")}</div>`); } }
       else $$(".choice",this.node).forEach(b=>{ if(String(b.dataset.c)===String(q.answer)) b.classList.add("right"); });
@@ -4595,12 +4642,14 @@ UI.screen("school",{ title:"School",
       <h4>Milestones</h4><p class="small">📜 Diplomas: ${grads.length?grads.map(g=>"Grade "+g).join(", "):"none yet"} · 🐝 Spelling Bee this week: ${bee?bee.score+"/"+bee.total:"not yet"} · 🔁 Practice list: ${rv} question${rv===1?"":"s"}</p>
       <h4>Settings</h4><div class="setrow"><span class="se">🔊</span><div class="st"><b>Read questions aloud</b><small>The cat reads each question in a female voice</small></div><button class="toggle ${S.settings.readAloud!==false?"on":""}" id="ppRead"><span></span></button></div>
       <div class="setrow"><span class="se">📈</span><div class="st"><b>Auto grade</b><small>Adjust difficulty per subject</small></div><button class="toggle ${S.settings.autoGrade!==false?"on":""}" id="ppAuto"><span></span></button></div>
+      <div class="setrow"><span class="se">🗣️</span><div class="st"><b>School voice</b><small id="ppVoiceSt">${Teacher.engine()==="grok"?"Using Grok's voice ✓":Teacher.engine()==="checking"?"Grok's voice will be tried next time she speaks":(S.settings.schoolVoice==="device"?"Using the device voice":"Grok's voice isn't connected — add the speak() function to Apps Script (file apps-script-speak.gs) or an xAI key in Settings")}</small></div><div class="seg" id="ppVoice">${[["grok","Grok"],["device","Device"]].map(([v,l])=>`<button class="${(S.settings.schoolVoice==="device"?"device":"grok")===v?"on":""}" data-v="${v}">${l}</button>`).join("")}</div></div>
       <div class="setrow"><span class="se">🐢</span><div class="st"><b>Reading speed</b></div><div class="seg" id="ppRate">${[[0.8,"Slow"],[0.95,"Normal"],[1.1,"Fast"]].map(([v,l])=>`<button class="${(S.settings.readRate||0.95)===v?"on":""}" data-r="${v}">${l}</button>`).join("")}</div></div>
       ${rv?`<button class="minibtn" id="ppClear">Clear the practice list</button>`:""}`,buttons:[{label:"Done",cls:"purple"}],onClose:()=>{ if(UI.current==="school"&&!this.session){ this.renderHead(); this.renderSubjects(); } }});
     $$(".pp-step",ov).forEach(b=>b.addEventListener("click",()=>{ Sfx.tab(); const id=b.dataset.pg; School.setGrade(id,School.gradeFor(id)+ +b.dataset.d); Save.save(); b.parentElement.querySelector("b").textContent=School.gradeFor(id); }));
     $("#ppRead",ov).addEventListener("click",e=>{ S.settings.readAloud=S.settings.readAloud===false; Save.save(); e.currentTarget.classList.toggle("on",S.settings.readAloud); });
     $("#ppAuto",ov).addEventListener("click",e=>{ S.settings.autoGrade=S.settings.autoGrade===false; Save.save(); e.currentTarget.classList.toggle("on",S.settings.autoGrade); });
     $("#ppRate",ov).addEventListener("click",e=>{ const b=e.target.closest("button"); if(!b) return; S.settings.readRate=+b.dataset.r; Save.save(); $$("#ppRate button",ov).forEach(x=>x.classList.toggle("on",x===b)); Teacher.say("This is how fast I'll read.",{force:true}); });
+    $("#ppVoice",ov).addEventListener("click",e=>{ const b=e.target.closest("button"); if(!b) return; S.settings.schoolVoice=b.dataset.v; Save.save(); $$("#ppVoice button",ov).forEach(x=>x.classList.toggle("on",x===b)); Teacher.say("Hi! This is how I sound when I read.",{force:true,onstart:()=>{ const st=$("#ppVoiceSt",ov); if(st) st.textContent=Teacher.engine()==="grok"?"Using Grok's voice ✓":"Using the device voice"; }}); });
     const cl=$("#ppClear",ov); if(cl) cl.addEventListener("click",()=>{ sc.review=[]; Save.save(); cl.textContent="Cleared ✓"; cl.disabled=true; }); }
 });
 
@@ -5473,3 +5522,4 @@ if(document.readyState==="loading") document.addEventListener("DOMContentLoaded"
 </script>
 </body>
 </html>
+
